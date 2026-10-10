@@ -71,6 +71,7 @@ fi
 step(){ printf '\n%s==> %s%s\n' "$C_B" "$*" "$C_0"; }
 ok()  { printf '  %s✔%s %s\n' "$C_G" "$C_0" "$*"; }
 warn(){ printf '  %s!%s %s\n' "$C_Y" "$C_0" "$*"; }
+info(){ printf '  %s→%s %s\n' "$C_B" "$C_0" "$*"; }
 die() { printf '%s✘ %s%s\n' "$C_R" "$*" "$C_0" >&2; exit 1; }
 have(){ command -v "$1" >/dev/null 2>&1; }
 usage(){
@@ -148,7 +149,34 @@ dnfi(){
 net_available(){
   timeout 5 bash -c 'exec 3<>/dev/tcp/mirrors.fedoraproject.org/443' >/dev/null 2>&1
 }
-have_tty(){ ( : </dev/tty ) 2>/dev/null; }
+# Терминал пользователя для вопросов. При «curl | sudo bash» у скрипта нет
+# stdin-терминала, а /dev/tty внутри sudo (use_pty) — это псевдотерминал sudo, не
+# связанный с клавиатурой: ввод туда не доходит. Поэтому ищем настоящий терминал
+# вызвавшего пользователя среди предков процесса. Результат — в TTY_IN.
+find_tty(){
+  TTY_IN=""
+  if [[ -t 0 ]]; then TTY_IN="/dev/stdin"; return 0; fi
+  local mine1 mine2 pid t fd i
+  mine1=$(readlink /proc/self/fd/1 2>/dev/null || true)
+  mine2=$(readlink /proc/self/fd/2 2>/dev/null || true)
+  pid=$$
+  for i in 1 2 3 4 5 6 7 8; do
+    pid=$(awk '/^PPid:/{print $2}' "/proc/$pid/status" 2>/dev/null || true)
+    [[ "$pid" =~ ^[0-9]+$ ]] && (( pid > 1 )) || break
+    for fd in 0 1 2; do
+      t=$(readlink "/proc/$pid/fd/$fd" 2>/dev/null || true)
+      case "$t" in
+        /dev/pts/*|/dev/tty[0-9]*)
+          [[ "$t" == "$mine1" || "$t" == "$mine2" ]] && continue
+          if [[ -n "${SUDO_UID:-}" && "$(stat -c %u "$t" 2>/dev/null || echo x)" != "$SUDO_UID" ]]; then continue; fi
+          [[ -r $t ]] || continue
+          TTY_IN="$t"; return 0 ;;
+      esac
+    done
+  done
+  if ( : </dev/tty ) 2>/dev/null; then TTY_IN="/dev/tty"; return 0; fi
+  return 1
+}
 
 # Данные провайдера DNS: серверы, адрес и имя для проверки TLS
 dns_provider(){
@@ -178,7 +206,7 @@ ask_dns(){
     warn "офлайн: DNS-over-TLS не предлагается (проверить его без интернета нельзя)"
     DNS_CHOICE="none"; return 0
   fi
-  if ! have_tty; then
+  if ! find_tty; then
     warn "Нет терминала для вопроса — DNS не меняется (задайте --dns=cloudflare|quad9|google)"
     DNS_CHOICE="none"; return 0
   fi
@@ -189,14 +217,21 @@ ask_dns(){
     echo "    2) Cloudflare 1.1.1.1 — быстрый"
     echo "    3) Quad9 9.9.9.9 — блокирует вредоносные домены"
     echo "    4) Google 8.8.8.8 — стабильный"
-  } > /dev/tty
-  local ans=""
-  read -r -t 120 -p "  Ваш выбор [1-4, Enter = 1]: " ans < /dev/tty || ans=""
-  case "$ans" in
-    2) DNS_CHOICE="cloudflare" ;;
-    3) DNS_CHOICE="quad9" ;;
-    4) DNS_CHOICE="google" ;;
-    *) DNS_CHOICE="none"; ok "DNS остаётся без изменений" ;;
+  } >&2
+  info "Введите номер и нажмите Enter (жду 60 с; без ответа DNS не изменится)"
+  local ans="" rc=0
+  read -r -t 60 -p "  Ваш выбор [1-4, Enter = 1]: " ans < "$TTY_IN" || rc=$?
+  if (( rc > 128 )); then
+    echo >&2
+    warn "Ответ не получен за 60 с — DNS остаётся без изменений"
+    warn "Если ввод не работает, запустите так: sudo bash -c \"\$(curl -fsSL $RAW_URL)\" -- --apply"
+    DNS_CHOICE="none"; return 0
+  fi
+  case "${ans//[[:space:]]/}" in
+    2) DNS_CHOICE="cloudflare"; ok "Выбрано: Cloudflare 1.1.1.1" ;;
+    3) DNS_CHOICE="quad9";      ok "Выбрано: Quad9 9.9.9.9" ;;
+    4) DNS_CHOICE="google";     ok "Выбрано: Google 8.8.8.8" ;;
+    *) DNS_CHOICE="none";       ok "Выбрано: не менять DNS" ;;
   esac
 }
 
@@ -291,13 +326,17 @@ sysctl_add(){
   if [[ ! -e $(sysctl_path "$k") ]]; then warn "sysctl $k недоступен — пропуск"; return 0; fi
   sysctl_record "$k"
   SYSCTL_BUF+="${k} = ${v}"$'\n'
+  if (( ! DRY )); then printf '    • %s = %s\n' "$k" "$v"; fi
 }
 reload_all(){
+  info "Перечитываю конфигурацию systemd"
   try systemctl daemon-reload
+  info "Применяю параметры ядра (sysctl --system)"
   try sysctl --system >/dev/null
+  info "Обновляю правила устройств (udev)"
   try udevadm control --reload
-  if have nmcli; then try nmcli general reload conf; fi
-  if (( DNS_CHANGED )); then try systemctl restart systemd-resolved; fi
+  if have nmcli; then info "Обновляю настройки NetworkManager"; try nmcli general reload conf; fi
+  if (( DNS_CHANGED )); then info "Перезапускаю systemd-resolved"; try systemctl restart systemd-resolved; fi
 }
 
 # Копия скрипта в /usr/local/sbin: чтобы --undo и --status работали без интернета.
@@ -399,7 +438,10 @@ for v in /sys/class/drm/card*/device/vendor; do
   case "$(<"$v")" in 0x8086) GPU_INTEL=1 ;; 0x1002) GPU_AMD=1 ;; 0x10de) GPU_NVIDIA=1 ;; esac
 done
 GPU_LIST=""; (( GPU_INTEL )) && GPU_LIST+="Intel "; (( GPU_AMD )) && GPU_LIST+="AMD "; (( GPU_NVIDIA )) && GPU_LIST+="NVIDIA " || true
-ok "Fedora ${FEDORA_VER:-rawhide}, GPU: ${GPU_LIST:-не найдена}"
+if [[ -z "$GPU_LIST" ]]; then
+  if (( IS_VM )); then GPU_LIST="виртуальный адаптер (драйверы GPU не нужны)"; else GPU_LIST="не найдена"; fi
+fi
+ok "Fedora ${FEDORA_VER:-rawhide}, GPU: ${GPU_LIST}"
 ok "Тип: $( (( IS_LAPTOP )) && echo ноутбук || echo ПК )$( (( IS_VM )) && echo ', виртуальная машина' )"
 (( DRY )) && warn "РЕЖИМ ПЛАНА: ничего не меняется. Для применения добавьте --apply"
 case "$NET_MODE" in
@@ -427,6 +469,7 @@ FAILED_BEFORE=$(systemctl --failed --no-legend 2>/dev/null | wc -l || true)
 #===============================================================================
 if (( DO_NET )); then
   step "Интернет"
+  info "Настраиваю TCP: быстрые повторные соединения, буферы 16 МБ, защита от «чёрных дыр» MTU"
   sysctl_add net.ipv4.tcp_fastopen 3
   sysctl_add net.ipv4.tcp_mtu_probing 1
   sysctl_add net.ipv4.tcp_slow_start_after_idle 0
@@ -438,6 +481,7 @@ if (( DO_NET )); then
   sysctl_add net.core.netdev_max_backlog 16384
   sysctl_add net.core.somaxconn 4096
   if modinfo tcp_bbr >/dev/null 2>&1; then
+    info "Включаю BBR + fq: быстрее при потерях пакетов и большом пинге"
     write_file /etc/modules-load.d/99-fedora-optimize-bbr.conf <<'EOF'
 tcp_bbr
 EOF
@@ -454,7 +498,16 @@ EOF
   # Wi-Fi: на ПК отключаем энергосбережение адаптера — помогает, если есть лаги
   # и скачки пинга по Wi-Fi. На ноутбуках не трогаем (это съедает батарею).
   # Пропустить: --no-wifi
-  if (( DO_WIFI && ! IS_LAPTOP && ! IS_VM )) && compgen -G "/sys/class/net/*/wireless" >/dev/null; then
+  if (( ! DO_WIFI )); then
+    ok "Wi-Fi: пропущено (--no-wifi)"
+  elif (( IS_LAPTOP )); then
+    ok "Wi-Fi: ноутбук — энергосбережение не трогаю (чтобы не садить батарею)"
+  elif (( IS_VM )); then
+    ok "Wi-Fi: виртуальная машина — пропускаю"
+  elif ! compgen -G "/sys/class/net/*/wireless" >/dev/null; then
+    ok "Wi-Fi: адаптер не найден — пропускаю"
+  else
+    info "Отключаю энергосбережение Wi-Fi (меньше лагов и скачков пинга)"
     write_file /etc/NetworkManager/conf.d/99-fedora-optimize-wifi.conf <<'EOF'
 [connection]
 wifi.powersave = 2
@@ -498,6 +551,7 @@ ensure_rpmfusion(){
   if rpm -q rpmfusion-free-release rpmfusion-nonfree-release >/dev/null 2>&1; then return 0; fi
   if (( OFFLINE )); then warn "офлайн: RPM Fusion не подключён — пропуск"; return 1; fi
   warn "Подключается сторонний репозиторий RPM Fusion"
+  info "Устанавливаю RPM Fusion (free и nonfree)"
   try dnf install -y \
     "https://mirrors.rpmfusion.org/free/fedora/rpmfusion-free-release-${FEDORA_VER}.noarch.rpm" \
     "https://mirrors.rpmfusion.org/nonfree/fedora/rpmfusion-nonfree-release-${FEDORA_VER}.noarch.rpm"
@@ -507,11 +561,13 @@ ensure_rpmfusion(){
 if (( DO_MM )) && (( ! IS_VM )); then
   step "Кодеки и аппаратное декодирование видео"
   if ensure_rpmfusion; then
+    info "Ставлю полный ffmpeg (заменит урезанный ffmpeg-free) — может занять несколько минут"
     dnfi ffmpeg --allowerasing
+    info "Ставлю кодеки gstreamer и openh264 для браузеров и приложений"
     dnfi gstreamer1-plugins-good gstreamer1-plugins-ugly gstreamer1-plugin-libav gstreamer1-libav \
          gstreamer1-plugins-bad-freeworld gstreamer1-plugin-openh264 mozilla-openh264 libva-utils vulkan-tools
-    if (( GPU_INTEL )); then dnfi intel-media-driver; fi
-    if (( GPU_AMD )); then dnfi mesa-va-drivers-freeworld mesa-vdpau-drivers-freeworld --allowerasing; fi
+    if (( GPU_INTEL )); then info "Ставлю драйвер VA-API для Intel (intel-media-driver)"; dnfi intel-media-driver; fi
+    if (( GPU_AMD )); then info "Ставлю драйверы VA-API/VDPAU для AMD (Mesa freeworld)"; dnfi mesa-va-drivers-freeworld mesa-vdpau-drivers-freeworld --allowerasing; fi
     if (( GPU_NVIDIA && ! DO_NVIDIA )); then
       warn "NVIDIA найдена: проприетарный драйвер ставится флагом --nvidia (нужен учёт Secure Boot)"
     fi
@@ -528,6 +584,7 @@ if (( DO_NVIDIA )); then
   if (( ! GPU_NVIDIA )); then
     warn "Видеокарта NVIDIA не найдена — пропуск"
   elif ensure_rpmfusion; then
+    info "Ставлю драйвер NVIDIA (akmod-nvidia, CUDA, VA-API) — модуль соберётся в фоне"
     dnfi akmod-nvidia xorg-x11-drv-nvidia-cuda libva-nvidia-driver
     SB_STATE=""; if have mokutil; then SB_STATE=$(mokutil --sb-state 2>/dev/null || true); fi
     if grep -qi 'enabled' <<<"$SB_STATE"; then
@@ -535,10 +592,11 @@ if (( DO_NVIDIA )); then
       if (( DRY )); then
         echo "  [план] kmodgenca -a && mokutil --import /etc/pki/akmods/certs/public_key.der"
       else
+        info "Создаю ключ подписи модулей (kmodgenca)"
         try kmodgenca -a
-        if ( : </dev/tty ) 2>/dev/null; then
+        if find_tty; then
           warn "Сейчас будет запрошен пароль (одноразовый) — запомните его для экрана MOK при перезагрузке"
-          try mokutil --import /etc/pki/akmods/certs/public_key.der </dev/tty
+          try mokutil --import /etc/pki/akmods/certs/public_key.der < "$TTY_IN"
         else
           warn "Нет терминала для ввода пароля. Выполните вручную: sudo mokutil --import /etc/pki/akmods/certs/public_key.der"
         fi
@@ -563,6 +621,14 @@ if (( ! DRY )); then
     ok "Новых упавших юнитов нет"
   fi
   install_self
+  step "Что сделано"
+  if [[ -f $MANIFEST ]]; then
+    while IFS= read -r f; do
+      if [[ -n $f && $f != /usr/local/sbin/* ]]; then ok "настройка: $f"; fi
+    done < "$MANIFEST"
+  else
+    ok "Файлы настроек не создавались (всё уже было настроено или пропущено)"
+  fi
   status
   if (( DO_NVIDIA )); then ok "Перезагрузка нужна после установки драйвера NVIDIA."; fi
   ok "Готово. Откат: $UNDO_HINT --undo"

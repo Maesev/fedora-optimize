@@ -184,6 +184,11 @@ curl -fsSL https://raw.githubusercontent.com/Maesev/fedora-optimize/main/fedora-
 
 ### Вопросы
 
+**Вопрос про DNS не принимает ввод (цифра «уходит» в терминал: `bash: 3: команда не найдена`).**
+Такое было в ранней версии: при `curl | sudo bash` ввод не доходил до скрипта. В текущей версии скрипт сам находит ваш терминал; если вопрос всё равно не принимает ответ, он через 60 секунд оставит DNS без изменений и подскажет запуск в таком виде (ввод работает всегда):
+`sudo bash -c "$(curl -fsSL https://raw.githubusercontent.com/Maesev/fedora-optimize/main/fedora-optimize.sh)" -- --apply`.
+Можно также заранее указать провайдера и не отвечать на вопрос: `--dns=quad9`.
+
 **`Запуск из конвейера требует root`.**
 Добавьте `sudo` перед `bash`: `curl ... | sudo bash -s -- --apply`.
 
@@ -387,6 +392,11 @@ Checks:
 - RPM Fusion is a third-party repository (not part of Fedora).
 
 ### FAQ
+
+**The DNS question doesn't accept input (the digit "leaks" into the shell: `bash: 3: command not found`).**
+An early version had this problem: with `curl | sudo bash` the input never reached the script. The current version finds your terminal itself; if the question still doesn't take an answer, it leaves DNS unchanged after 60 seconds and suggests running it like this (input always works):
+`sudo bash -c "$(curl -fsSL https://raw.githubusercontent.com/Maesev/fedora-optimize/main/fedora-optimize.sh)" -- --apply`.
+You can also pick the provider up front and skip the question: `--dns=quad9`.
 
 **`Запуск из конвейера требует root` (pipeline requires root).**
 Put `sudo` before `bash`: `curl ... | sudo bash -s -- --apply`.
