@@ -30,6 +30,11 @@
 #                      после — что TLS-соединение реально установилось; если нет,
 #                      автоматически откатывает.
 #   --no-dns           не спрашивать про DNS (то же, что --dns=none)
+#   --dns-strict       строгий режим DNS-over-TLS: сертификат сервера проверяется
+#                      при каждом запросе. Надёжнее, но DNS перестанет работать в
+#                      сетях, где закрыт порт 853 (по умолчанию — opportunistic:
+#                      шифрование есть, сертификат не проверяется, при блокировке
+#                      порта DNS продолжает работать без шифрования)
 #   --no-wifi          не отключать энергосбережение Wi-Fi на ПК
 #   --no-network       пропустить настройки интернета (оставить только видео/GPU)
 #   --no-multimedia    пропустить кодеки, RPM Fusion и VA-API (оставить только сеть)
@@ -50,6 +55,7 @@ PROFILE_STATE="${STATE_DIR}/power-profile.txt"
 DRY=1; UNDO=0; STATUS=0
 DO_NET=1; DO_MM=1; DO_WIFI=1; DO_NVIDIA=0; DNS_CHOICE=""
 DNS_CHANGED=0
+DNS_STRICT=0
 NET_MODE="auto"   # auto | offline | online
 OFFLINE=0
 
@@ -93,6 +99,7 @@ for a in "$@"; do
     --online)            NET_MODE="online" ;;
     --dns=*)             DNS_CHOICE="${a#--dns=}" ;;
     --no-dns)            DNS_CHOICE="none" ;;
+    --dns-strict)        DNS_STRICT=1 ;;
     -h|--help)           usage ;;
     *) die "Неизвестный параметр: $a (см. --help)" ;;
   esac
@@ -265,8 +272,17 @@ dns_precheck(){
 # установилось. Иначе настройка откатывается, чтобы запросы не уходили открыто.
 verify_dns(){
   step "Проверка DNS-over-TLS"
-  local d i resolved=0 tls=0
+  local d i resolved=0 tls=0 applied=0 status
   sleep 2
+  # 1) настройки действительно применились: сервер виден в resolvectl
+  status=$(resolvectl status 2>/dev/null || true)
+  if grep -qF "${DNS_PROBE_IP}#${DNS_PROBE_HOST}" <<<"$status" \
+     && grep -qE '(^|[ =])(\+DNSOverTLS|DNSOverTLS=(opportunistic|yes))' <<<"$status"; then
+    applied=1; ok "Настройки применились: ${DNS_PROBE_IP}#${DNS_PROBE_HOST}, DNS-over-TLS включён в resolved"
+  else
+    warn "В resolvectl не видно новых настроек DNS-over-TLS"
+  fi
+  # 2) имена разрешаются; 3) TLS-соединение (порт 853) реально установлено
   if have resolvectl; then try resolvectl flush-caches; fi
   for d in example.com iana.org fedoraproject.org; do
     if have resolvectl; then timeout 8 resolvectl query "$d" >/dev/null 2>&1 && resolved=1
@@ -276,12 +292,19 @@ verify_dns(){
     if [[ -n "$(ss -Htn state established '( dport = :853 )' 2>/dev/null)" ]]; then tls=1; break; fi
     sleep 1
   done
-  if (( resolved && tls )); then
+  if (( applied && resolved && tls )); then
     ok "Имена разрешаются, TLS-соединение с DNS-сервером установлено — DNS-over-TLS работает"
+    if (( DNS_STRICT )); then
+      ok "Строгий режим: сертификат сервера проверяется при каждом запросе"
+    else
+      warn "Режим opportunistic: запросы шифруются, но сертификат сервера не проверяется (для строгой проверки: --dns-strict)"
+    fi
+    warn "Домены из локальной сети (например, router.lan) теперь могут не разрешаться — DNS из DHCP больше не основной"
     return 0
   fi
   (( resolved )) || warn "Имена не разрешаются с новыми настройками DNS"
   (( tls ))      || warn "TLS-соединение (порт 853) не установлено — запросы шли бы без шифрования"
+  (( applied ))  || warn "Новые настройки DNS не подхватились systemd-resolved"
   warn "Откатываю настройки DNS"
   rm -f -- "$DNS_FILE"
   if [[ -f $MANIFEST ]]; then sed -i "\|^${DNS_FILE}\$|d" "$MANIFEST"; fi
@@ -525,11 +548,16 @@ EOF
     elif (( ! DRY )) && ! systemctl is-active systemd-resolved >/dev/null 2>&1; then
       warn "systemd-resolved не активен — DNS не меняем"
     elif dns_precheck; then
+      # Формат DNS= для systemd-resolved: IP#имя_для_TLS (имя нужно для SNI и
+      # проверки сертификата). Формат tls://имя здесь не используется.
+      # Domains=~. — чтобы этот DNS был основным, а не только запасным после
+      # DNS из DHCP.
+      if (( DNS_STRICT )); then DNS_MODE="yes"; else DNS_MODE="opportunistic"; fi
+      info "Режим DNS-over-TLS: $DNS_MODE"
       write_file "$DNS_FILE" <<EOF
 [Resolve]
 DNS=${DNS_SERVERS}
-DNSOverTLS=opportunistic
-DNSSEC=allow-downgrade
+DNSOverTLS=${DNS_MODE}
 Domains=~.
 EOF
       DNS_CHANGED=1
