@@ -109,6 +109,7 @@ fedora-optimize --status
 | `--status` | показать текущие значения (root не нужен) |
 | `--nvidia` | драйвер NVIDIA из RPM Fusion с учётом Secure Boot |
 | `--dns=ИМЯ` | DNS-over-TLS: `cloudflare`, `quad9`, `google` или `none`. Без флага скрипт **спросит в консоли** (по умолчанию — не менять) |
+| `--dns-strict` | строгий DNS-over-TLS: сертификат сервера проверяется при каждом запросе (по умолчанию — `opportunistic`) |
 | `--no-dns` | не спрашивать про DNS (то же, что `--dns=none`) |
 | `--no-wifi` | не отключать энергосбережение Wi-Fi на ПК |
 | `--no-network` | пропустить настройки интернета (останутся кодеки и видео) |
@@ -163,6 +164,22 @@ curl -fsSL https://raw.githubusercontent.com/Maesev/fedora-optimize/main/fedora-
 Проверки:
 1. **До включения:** доступен ли порт 853 и корректен ли TLS-сертификат сервера. Если нет (например, провайдер блокирует DoT), DNS **не меняется**.
 2. **После включения:** разрешаются ли имена и **действительно ли установилось TLS-соединение** с DNS-сервером. Если нет, настройки автоматически откатываются, чтобы запросы не уходили открыто на чужой сервер.
+
+**Что именно записывается** (`/etc/systemd/resolved.conf.d/99-fedora-optimize-dns.conf`):
+
+```ini
+[Resolve]
+DNS=9.9.9.9#dns.quad9.net 149.112.112.112#dns.quad9.net 2620:fe::fe#dns.quad9.net 2620:fe::9#dns.quad9.net
+DNSOverTLS=opportunistic
+Domains=~.
+```
+
+- Формат `IP#имя` — это синтаксис systemd-resolved: имя после `#` используется для SNI и проверки сертификата. Формат `tls://имя` в systemd-resolved **не** используется (он из AdGuard/dnsmasq).
+- Имена серверов: Quad9 — `dns.quad9.net`, Cloudflare — `cloudflare-dns.com`, Google — `dns.google` (адреса и имена сверены с документацией провайдеров).
+- `Domains=~.` делает этот DNS основным для всех запросов, а не запасным после DNS из DHCP. Побочный эффект: имена из локальной сети (например, `router.lan`) могут перестать разрешаться.
+- **Режимы.** По умолчанию `DNSOverTLS=opportunistic`: запросы шифруются, если сервер отвечает по TLS, но сертификат **не проверяется**, а при недоступности порта 853 resolved молча переходит на обычный DNS. С `--dns-strict` включается `DNSOverTLS=yes`: сертификат проверяется всегда, но там, где порт 853 заблокирован, DNS перестанет работать. Скрипт проверяет доступность заранее и откатывается при сбое.
+- DNSSEC скрипт не трогает: `DNSSEC=no/unsupported` в `resolvectl status` — нормальное значение.
+- Проверить вручную: `resolvectl status` (должны быть `+DNSOverTLS` и `9.9.9.9#dns.quad9.net`) и `ss -tn state established '( dport = :853 )'`.
 
 ---
 
@@ -318,6 +335,7 @@ fedora-optimize --status
 | `--status` | show current values (no root needed) |
 | `--nvidia` | NVIDIA driver from RPM Fusion, Secure Boot aware |
 | `--dns=NAME` | DNS-over-TLS: `cloudflare`, `quad9`, `google` or `none`. Without the flag the script **asks in the console** (default: leave DNS unchanged) |
+| `--dns-strict` | strict DNS-over-TLS: the server certificate is validated on every query (default: `opportunistic`) |
 | `--no-dns` | don't ask about DNS (same as `--dns=none`) |
 | `--no-wifi` | don't turn off Wi-Fi power saving on desktops |
 | `--no-network` | skip network tuning (codecs and video remain) |
@@ -372,6 +390,22 @@ To skip the question: `--dns=cloudflare|quad9|google` (enable) or `--dns=none` /
 Checks:
 1. **Before enabling:** is port 853 reachable and is the server's TLS certificate valid? If not (e.g. your ISP blocks DoT), DNS is **left unchanged**.
 2. **After enabling:** do names resolve and is a **TLS connection to the DNS server really established**? If not, the settings are rolled back automatically so queries don't leak in plaintext to a third-party server.
+
+**What exactly gets written** (`/etc/systemd/resolved.conf.d/99-fedora-optimize-dns.conf`):
+
+```ini
+[Resolve]
+DNS=9.9.9.9#dns.quad9.net 149.112.112.112#dns.quad9.net 2620:fe::fe#dns.quad9.net 2620:fe::9#dns.quad9.net
+DNSOverTLS=opportunistic
+Domains=~.
+```
+
+- The `IP#name` form is systemd-resolved syntax: the name after `#` is used for SNI and certificate validation. The `tls://name` form is **not** used by systemd-resolved (it belongs to AdGuard/dnsmasq-style configs).
+- Server names: Quad9 — `dns.quad9.net`, Cloudflare — `cloudflare-dns.com`, Google — `dns.google` (addresses and names checked against the providers' documentation).
+- `Domains=~.` makes this DNS the primary one for all queries instead of a fallback after the DHCP-provided DNS. Side effect: local-network names (e.g. `router.lan`) may stop resolving.
+- **Modes.** The default is `DNSOverTLS=opportunistic`: queries are encrypted when the server answers over TLS, but the certificate is **not validated**, and if port 853 is unreachable resolved silently falls back to plain DNS. `--dns-strict` sets `DNSOverTLS=yes`: the certificate is always validated, but DNS stops working wherever port 853 is blocked. The script checks reachability beforehand and rolls back on failure.
+- The script does not touch DNSSEC: `DNSSEC=no/unsupported` in `resolvectl status` is normal here.
+- Verify manually: `resolvectl status` (look for `+DNSOverTLS` and `9.9.9.9#dns.quad9.net`) and `ss -tn state established '( dport = :853 )'`.
 
 ---
 
